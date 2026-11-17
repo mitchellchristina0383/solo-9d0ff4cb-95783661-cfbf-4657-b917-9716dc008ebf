@@ -36,6 +36,10 @@ JOBLOG_DATA_DIR=./data uvicorn joblog.main:app --port 8000
 | `GET`  | `/backups/{id}/download` | Download the verified `.db` file |
 | `POST` | `/backups/{id}/restore` | Restore into an independent target (`target_name`, `overwrite`) |
 | `GET`  | `/restores/{target_name}/logs` | Read logs from a restored target (read-only) |
+| `POST` | `/handoffs` | Establish an incremental handoff (`consumer_id`, `backup_id`) |
+| `GET`  | `/handoffs/{consumer_id}` | Handoff state: anchor, progress cursor, open batch |
+| `POST` | `/handoffs/{consumer_id}/claim` | Claim the next batch (`limit`); idempotent while unconfirmed |
+| `POST` | `/handoffs/{consumer_id}/confirm` | Confirm the open batch (`batch_token`) and advance progress |
 | `GET`  | `/health` | Liveness/readiness |
 
 ### Typical flow (`/docs` order)
@@ -48,6 +52,30 @@ JOBLOG_DATA_DIR=./data uvicorn joblog.main:app --port 8000
 5. `POST /backups/{id}/restore` with `{"target_name": "incident-2026.db"}`.
 6. `GET /restores/incident-2026.db/logs` — shows the logs committed before the
    backup and none appended afterwards.
+
+### Incremental audit handoff (`/docs` order)
+
+A remote audit endpoint that already holds backup `bkp-...` collects every log
+committed after it:
+
+1. `POST /handoffs` with `{"consumer_id": "auditor-eu", "backup_id": "bkp-..."}`.
+   The backup is verified first; the response anchors at the backup's last log
+   id (`start_after_id`, `0` for an empty backup). Retrying with the same
+   identifiers returns the original anchor (`200`); the same `consumer_id`
+   with a different backup is a `409` conflict.
+2. `POST /handoffs/auditor-eu/claim?limit=100` — returns the next logs in id
+   order plus a `batch_token`. Logs appended while the batch is open are left
+   for the next batch. Re-claiming before confirming returns the same token
+   and content.
+3. `POST /handoffs/auditor-eu/confirm` with `{"batch_token": "..."}` — only
+   the token of the currently open batch advances the progress cursor; a late
+   or foreign token is rejected (`409`) and changes nothing.
+4. Repeat claim → confirm until `claim` returns an empty `items` list (no
+   token is issued for an empty batch).
+
+Progress is stored in the source database, so a service restart simply
+resumes: an unconfirmed batch is re-served identically and confirmed batches
+are never re-delivered.
 
 ## Guarantees and how they are achieved
 
@@ -81,6 +109,18 @@ JOBLOG_DATA_DIR=./data uvicorn joblog.main:app --port 8000
   `/data/restores`; later appends to the source and later writes to the target
   are isolated from each other.  The restore endpoint never opens the source
   for writing.
+* **Verified handoff anchor.**  `POST /handoffs` verifies the referenced
+  backup (manifest, SHA-256, `integrity_check`) before recording anything; a
+  corrupt backup establishes no handoff.  The anchor is the verified backup's
+  `snapshot_max_id` (`0` when empty) and is immutable afterwards.
+* **Ordered, confirmed delivery.**  Batches are claimed and confirmed inside
+  single `BEGIN IMMEDIATE` transactions, so concurrent claims serialise and
+  see the same open batch, and only the current batch token can move the
+  progress cursor.  The batch's id range is fixed at claim time and re-read
+  from the append-only log on re-claim, so content cannot drift and no log
+  can be skipped or delivered twice.  Failed operations (stale token,
+  conflicting backup, corrupt backup) roll back and leave the persisted
+  progress untouched.
 
 ## Tests
 
@@ -92,7 +132,12 @@ python -m pytest
 The suite covers concurrent appends during a backup, frozen-snapshot
 behaviour, immutable published backups, independent restore, corrupt-backup
 restore with the target preserved, interrupted backups after restart,
-`ready`-row demotion, backup failure, restart persistence and `/docs`.
+`ready`-row demotion, backup failure, restart persistence and `/docs`.  The
+handoff suite covers anchoring at the verified backup end (empty backups
+start at 0), idempotent establish and backup conflicts, corrupt-backup
+rejection, in-order claim/re-claim/confirm with appends landing in the next
+batch, stale-token rejection, concurrent claims and confirmations, restart
+resumption, and failure operations leaving progress untouched.
 
 ## Notes / limits
 

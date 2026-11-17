@@ -41,6 +41,25 @@ CREATE TABLE IF NOT EXISTS backups (
     created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     completed_at   TEXT
 );
+
+-- Incremental handoff state for remote audit consumers.  One row per
+-- consumer identifier.  ``start_after_id`` is the verified backup's last log
+-- id (0 for an empty backup) and never changes after establishment;
+-- ``next_id`` is the durable progress cursor.  The open batch (if any) is
+-- stored inline as a token plus an inclusive id range, so an unconfirmed
+-- batch survives a restart and is re-served with identical content.
+CREATE TABLE IF NOT EXISTS handoffs (
+    consumer_id    TEXT PRIMARY KEY,
+    backup_id      TEXT NOT NULL,
+    start_after_id INTEGER NOT NULL,
+    next_id        INTEGER NOT NULL,
+    batch_token    TEXT,
+    batch_from_id  INTEGER,
+    batch_to_id    INTEGER,
+    created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    CHECK ((batch_token IS NULL) = (batch_to_id IS NULL))
+);
 """
 
 

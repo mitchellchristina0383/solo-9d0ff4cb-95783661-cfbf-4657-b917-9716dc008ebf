@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager, closing
 from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException, Query, status
+from fastapi import FastAPI, HTTPException, Query, Response, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
@@ -21,6 +21,12 @@ from .backup import (
     TargetExistsError,
 )
 from .db import Database
+from .handoff import (
+    HandoffConflict,
+    HandoffManager,
+    HandoffNotFound,
+    StaleBatchError,
+)
 
 DEFAULT_DATA_DIR = Path(os.environ.get("JOBLOG_DATA_DIR", "/data"))
 
@@ -94,6 +100,47 @@ class RestoredLogView(BaseModel):
     row_count: int
 
 
+class HandoffRequest(BaseModel):
+    consumer_id: str = Field(
+        min_length=1,
+        max_length=200,
+        description="Stable identifier of the remote audit endpoint.",
+    )
+    backup_id: str = Field(
+        min_length=1,
+        max_length=200,
+        description="Published backup the consumer already holds.",
+    )
+
+
+class OpenBatchView(BaseModel):
+    batch_token: str
+    from_id: int
+    to_id: int
+
+
+class HandoffView(BaseModel):
+    consumer_id: str
+    backup_id: str
+    start_after_id: int
+    next_id: int
+    open_batch: OpenBatchView | None
+    created_at: str
+    updated_at: str
+
+
+class BatchView(BaseModel):
+    consumer_id: str
+    batch_token: str | None
+    from_id: int | None
+    to_id: int | None
+    items: list[LogEntry]
+
+
+class ConfirmRequest(BaseModel):
+    batch_token: str = Field(min_length=1, max_length=200)
+
+
 class Health(BaseModel):
     status: str
     database: str
@@ -131,6 +178,7 @@ def create_app(
 
     database = Database(db_file)
     manager = BackupManager(database, backups)
+    handoffs = HandoffManager(database, manager)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -147,12 +195,15 @@ def create_app(
             "Append-only job logs with consistent, immutable backups and verified restore.\n\n"
             "Backups are published only after the snapshot and its SHA-256 manifest have "
             "been verified. Restores target an independent database file and leave the "
-            "source database writable."
+            "source database writable. Remote audit consumers use the /handoffs "
+            "endpoints to incrementally collect, in order and with per-batch "
+            "confirmation, every log committed after the backup they hold."
         ),
         lifespan=lifespan,
     )
     app.state.database = database
     app.state.manager = manager
+    app.state.handoffs = handoffs
     app.state.restore_dir = restores
     app.state.paths = {
         "database": db_file,
@@ -364,6 +415,90 @@ def create_app(
             ],
             row_count=int(total),
         )
+
+    @app.post(
+        "/handoffs",
+        response_model=HandoffView,
+        status_code=status.HTTP_201_CREATED,
+        tags=["handoff"],
+        summary="Establish an incremental handoff for an audit consumer",
+        description=(
+            "Verifies the given backup and anchors the handoff at the backup's "
+            "last log id (0 for an empty backup). Retrying with the same "
+            "consumer identifier returns the original anchor and current "
+            "progress (200); the same identifier with a different backup is a "
+            "conflict (409). A backup that fails verification establishes "
+            "nothing (409)."
+        ),
+    )
+    def establish_handoff(request: HandoffRequest, response: Response) -> HandoffView:
+        try:
+            view, created = handoffs.establish(request.consumer_id, request.backup_id)
+        except BackupNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except BackupVerificationError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=f"backup verification failed, handoff not established: {exc}",
+            ) from exc
+        except HandoffConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if not created:
+            response.status_code = status.HTTP_200_OK
+        return HandoffView(**view)
+
+    @app.get(
+        "/handoffs/{consumer_id}",
+        response_model=HandoffView,
+        tags=["handoff"],
+        summary="Get handoff state and progress for a consumer",
+    )
+    def get_handoff(consumer_id: str) -> HandoffView:
+        try:
+            return HandoffView(**handoffs.get(consumer_id))
+        except HandoffNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post(
+        "/handoffs/{consumer_id}/claim",
+        response_model=BatchView,
+        tags=["handoff"],
+        summary="Claim the next batch of logs (idempotent while unconfirmed)",
+        description=(
+            "Delivers the next logs in id order with a batch credential. The "
+            "batch boundary is fixed at claim time: logs appended while the "
+            "batch is open are left for the next batch. While the batch is "
+            "unconfirmed, claiming again returns the same credential and "
+            "content. An empty result opens no batch."
+        ),
+    )
+    def claim_batch(
+        consumer_id: str,
+        limit: int = Query(default=100, ge=1, le=1000),
+    ) -> BatchView:
+        try:
+            return BatchView(**handoffs.claim(consumer_id, limit))
+        except HandoffNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post(
+        "/handoffs/{consumer_id}/confirm",
+        response_model=HandoffView,
+        tags=["handoff"],
+        summary="Confirm the open batch and advance progress",
+        description=(
+            "Only the credential of the currently open batch advances the "
+            "progress cursor. A late, repeated or foreign credential is "
+            "rejected (409) and changes nothing."
+        ),
+    )
+    def confirm_batch(consumer_id: str, request: ConfirmRequest) -> HandoffView:
+        try:
+            return HandoffView(**handoffs.confirm(consumer_id, request.batch_token))
+        except HandoffNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except StaleBatchError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.get("/", include_in_schema=False)
     def root() -> dict[str, str]:
